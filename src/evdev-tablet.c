@@ -787,10 +787,14 @@ tablet_update_button(struct tablet_dispatch *tablet,
 
 	if (enable) {
 		set_bit(tablet->button_state.bits, evcode);
-		tablet_set_status(tablet, TABLET_BUTTONS_PRESSED);
+		if (tablet->device->scroll.method != LIBINPUT_CONFIG_SCROLL_ON_BUTTON_DOWN
+			|| evcode != tablet->device->scroll.button)
+			tablet_set_status(tablet, TABLET_BUTTONS_PRESSED);
 	} else {
 		clear_bit(tablet->button_state.bits, evcode);
-		tablet_set_status(tablet, TABLET_BUTTONS_RELEASED);
+		if (tablet->device->scroll.method != LIBINPUT_CONFIG_SCROLL_ON_BUTTON_DOWN
+			|| evcode != tablet->device->scroll.button)
+			tablet_set_status(tablet, TABLET_BUTTONS_RELEASED);
 	}
 }
 
@@ -1236,6 +1240,9 @@ tablet_notify_buttons(struct tablet_dispatch *tablet,
 		tablet_get_pressed_buttons(tablet, &buttons);
 	else
 		tablet_get_released_buttons(tablet, &buttons);
+
+	if (tablet->device->scroll.method == LIBINPUT_CONFIG_SCROLL_ON_BUTTON_DOWN)
+		clear_bit(buttons.bits, tablet->device->scroll.button);
 
 	tablet_notify_button_mask(tablet,
 				  device,
@@ -1735,9 +1742,23 @@ tablet_send_events(struct tablet_dispatch *tablet,
 	assert(tablet->axes.delta.x == 0);
 	assert(tablet->axes.delta.y == 0);
 
+	if (tablet->device->scroll.method == LIBINPUT_CONFIG_SCROLL_ON_BUTTON_DOWN
+		&& bit_is_set(tablet->button_state.bits, tablet->device->scroll.button)) {
+		float button_scroll_speed = 2;
+		struct normalized_coords scroll_delta;
+		scroll_delta.x = axes.delta.x * button_scroll_speed;
+		scroll_delta.y = axes.delta.y * button_scroll_speed;
+		evdev_post_scroll(device, time,
+				  LIBINPUT_POINTER_AXIS_SOURCE_CONTINUOUS,
+				  &scroll_delta);
+	}
+
 	tablet_send_proximity_in(tablet, tool, device, &axes, time);
-	if (!tablet_send_tip(tablet, tool, device, &axes, time))
-		tablet_send_axes(tablet, tool, device, &axes, time);
+	if (!tablet_send_tip(tablet, tool, device, &axes, time)) {
+		if (tablet->device->scroll.method != LIBINPUT_CONFIG_SCROLL_ON_BUTTON_DOWN
+			|| !bit_is_set(tablet->button_state.bits, tablet->device->scroll.button))
+			tablet_send_axes(tablet, tool, device, &axes, time);
+	}
 
 	tablet_unset_status(tablet, TABLET_TOOL_ENTERING_CONTACT);
 	tablet_reset_changed_axes(tablet);
@@ -2413,6 +2434,58 @@ tablet_init_left_handed(struct evdev_device *device)
 				       tablet_change_to_left_handed);
 }
 
+static uint32_t
+tablet_scroll_config_scroll_method_get_methods(struct libinput_device *device)
+{
+	return LIBINPUT_CONFIG_SCROLL_ON_BUTTON_DOWN;
+}
+
+static enum libinput_config_scroll_method
+tablet_scroll_config_scroll_method_get_default_method(struct libinput_device *device)
+{
+	return LIBINPUT_CONFIG_SCROLL_ON_BUTTON_DOWN;
+}
+
+static uint32_t
+tablet_scroll_get_default_button(struct libinput_device *device)
+{
+	return BTN_STYLUS;
+}
+
+static void
+tablet_change_scroll_method(struct evdev_device *device)
+{
+	struct tablet_dispatch *tablet = (struct tablet_dispatch*)device->dispatch;
+
+	if (device->scroll.want_method == device->scroll.method &&
+		device->scroll.want_button == device->scroll.button &&
+		device->scroll.want_lock_enabled == device->scroll.lock_enabled)
+		return;
+
+	if (bit_is_set(tablet->button_state.bits, tablet->device->scroll.button))
+		return;
+
+	device->scroll.method = device->scroll.want_method;
+	device->scroll.button = device->scroll.want_button;
+	device->scroll.lock_enabled = device->scroll.want_lock_enabled;
+	evdev_set_button_scroll_lock_enabled(device, device->scroll.lock_enabled);
+}
+
+static void
+tablet_init_scroll(struct tablet_dispatch *tablet, struct evdev_device *device)
+{
+	evdev_init_button_scroll(device,
+				 tablet_change_scroll_method);
+
+	tablet->device->scroll.config.get_methods = tablet_scroll_config_scroll_method_get_methods;
+	tablet->device->scroll.config.get_default_method = tablet_scroll_config_scroll_method_get_default_method;
+	tablet->device->scroll.config.get_default_button = tablet_scroll_get_default_button;
+	tablet->device->scroll.want_method = LIBINPUT_CONFIG_SCROLL_ON_BUTTON_DOWN;
+	tablet->device->scroll.method = tablet->device->scroll.want_method;
+	tablet->device->scroll.want_button = BTN_STYLUS;
+	tablet->device->scroll.button = tablet->device->scroll.want_button;
+}
+
 static bool
 tablet_is_aes(struct evdev_device *device,
 	      struct tablet_dispatch *tablet)
@@ -2550,6 +2623,7 @@ tablet_init(struct tablet_dispatch *tablet,
 	evdev_init_sendevents(device, &tablet->base);
 	tablet_init_left_handed(device);
 	tablet_init_smoothing(device, tablet);
+	tablet_init_scroll(tablet, device);
 
 	for (axis = LIBINPUT_TABLET_TOOL_AXIS_X;
 	     axis <= LIBINPUT_TABLET_TOOL_AXIS_MAX;
@@ -2569,6 +2643,8 @@ tablet_init(struct tablet_dispatch *tablet,
 			    "proxout",
 			    tablet_proximity_out_quirk_timer_func,
 			    tablet);
+
+	device->seat_caps |= EVDEV_DEVICE_POINTER;
 
 	return 0;
 }
