@@ -32,6 +32,8 @@
 #include <libwacom/libwacom.h>
 #endif
 
+#define DEFAULT_BUTTON_SCROLL_TIMEOUT ms2us(150)
+
 enum notify {
 	DONT_NOTIFY,
 	DO_NOTIFY,
@@ -45,6 +47,9 @@ static int FORCED_PROXOUT_TIMEOUT = 50 * 1000; /* µs */
 #define tablet_set_status(tablet_,s_) (tablet_)->status |= (s_)
 #define tablet_unset_status(tablet_,s_) (tablet_)->status &= ~(s_)
 #define tablet_has_status(tablet_,s_) (!!((tablet_)->status & (s_)))
+
+static struct libinput_tablet_tool *
+tablet_get_current_tool(struct tablet_dispatch *tablet);
 
 static inline void
 tablet_get_pressed_buttons(struct tablet_dispatch *tablet,
@@ -753,7 +758,8 @@ out:
 static void
 tablet_update_button(struct tablet_dispatch *tablet,
 		     uint32_t evcode,
-		     uint32_t enable)
+		     uint32_t enable,
+		     uint64_t time)
 {
 	switch (evcode) {
 	case BTN_LEFT:
@@ -777,14 +783,64 @@ tablet_update_button(struct tablet_dispatch *tablet,
 
 	if (enable) {
 		set_bit(tablet->button_state.bits, evcode);
-		if (tablet->device->scroll.method != LIBINPUT_CONFIG_SCROLL_ON_BUTTON_DOWN
-			|| evcode != tablet->device->scroll.button)
+		if (tablet->device->scroll.method == LIBINPUT_CONFIG_SCROLL_ON_BUTTON_DOWN
+			&& evcode == tablet->device->scroll.button) {
+			tablet->device->scroll.button_scroll_state = BUTTONSCROLL_BUTTON_DOWN;
+
+			libinput_timer_set_flags(&tablet->device->scroll.timer,
+						 time + DEFAULT_BUTTON_SCROLL_TIMEOUT,
+						 TIMER_FLAG_NONE);
+			tablet->device->scroll.button_down_time = time;
+			evdev_log_debug(tablet->device, "wa_btnscroll: down\n");
+		} else {
 			tablet_set_status(tablet, TABLET_BUTTONS_PRESSED);
+		}
 	} else {
 		clear_bit(tablet->button_state.bits, evcode);
-		if (tablet->device->scroll.method != LIBINPUT_CONFIG_SCROLL_ON_BUTTON_DOWN
-			|| evcode != tablet->device->scroll.button)
+		if (tablet->device->scroll.method == LIBINPUT_CONFIG_SCROLL_ON_BUTTON_DOWN
+			&& evcode == tablet->device->scroll.button) {
+			struct libinput_tablet_tool *tool;
+			enum libinput_tablet_tool_tip_state tip_state;
+			tip_state = tablet_has_status(tablet, TABLET_TOOL_IN_CONTACT) ?
+				    LIBINPUT_TABLET_TOOL_TIP_DOWN : LIBINPUT_TABLET_TOOL_TIP_UP;
+
+			libinput_timer_cancel(&tablet->device->scroll.timer);
+			switch(tablet->device->scroll.button_scroll_state) {
+				case BUTTONSCROLL_IDLE:
+					evdev_log_bug_libinput(tablet->device,
+							       "wa_btnscroll: invalid state IDLE for button up\n");
+					break;
+				case BUTTONSCROLL_BUTTON_DOWN:
+				case BUTTONSCROLL_READY:
+					evdev_log_debug(tablet->device, "wa_btnscroll: cancel\n");
+
+					tool = tablet_get_current_tool(tablet);
+					tablet_notify_button(&tablet->device->base,
+							     tablet->device->scroll.button_down_time,
+							     tool,
+							     tip_state,
+							     &tablet->axes,
+							     evcode,
+							     LIBINPUT_BUTTON_STATE_PRESSED);
+					tablet_notify_button(&tablet->device->base,
+							     time,
+							     tool,
+							     tip_state,
+							     &tablet->axes,
+							     evcode,
+							     LIBINPUT_BUTTON_STATE_RELEASED);
+					break;
+				case BUTTONSCROLL_SCROLLING:
+					evdev_log_debug(tablet->device, "wa_btnscroll: up\n");
+					evdev_stop_scroll(tablet->device, time,
+							  LIBINPUT_POINTER_AXIS_SOURCE_CONTINUOUS);
+					break;
+			}
+
+			tablet->device->scroll.button_scroll_state = BUTTONSCROLL_IDLE;
+		} else {
 			tablet_set_status(tablet, TABLET_BUTTONS_RELEASED);
+		}
 	}
 }
 
@@ -847,7 +903,7 @@ tablet_process_key(struct tablet_dispatch *tablet,
 		}
 		break;
 	default:
-		tablet_update_button(tablet, e->code, e->value);
+		tablet_update_button(tablet, e->code, e->value, time);
 		break;
 	}
 }
@@ -1700,6 +1756,15 @@ tablet_send_events(struct tablet_dispatch *tablet,
 		   uint64_t time)
 {
 	struct tablet_axes axes = {0};
+	bool scroll_mode_on = false;
+	if (tablet->device->scroll.method == LIBINPUT_CONFIG_SCROLL_ON_BUTTON_DOWN
+		&& bit_is_set(tablet->button_state.bits, tablet->device->scroll.button)) {
+		// On BUTTONSCROLL_BUTTON_DOWN, this is the initial period where we swallow scroll events
+		if (device->scroll.button_scroll_state == BUTTONSCROLL_READY)
+			device->scroll.button_scroll_state = BUTTONSCROLL_SCROLLING;
+		if (device->scroll.button_scroll_state == BUTTONSCROLL_SCROLLING)
+			scroll_mode_on = true;
+	}
 
 	if (tablet_has_status(tablet, TABLET_TOOL_LEAVING_PROXIMITY)) {
 		/* Tool is leaving proximity, we can't rely on the last axis
@@ -1719,8 +1784,7 @@ tablet_send_events(struct tablet_dispatch *tablet,
 	assert(tablet->axes.delta.x == 0);
 	assert(tablet->axes.delta.y == 0);
 
-	if (tablet->device->scroll.method == LIBINPUT_CONFIG_SCROLL_ON_BUTTON_DOWN
-		&& bit_is_set(tablet->button_state.bits, tablet->device->scroll.button)) {
+	if (scroll_mode_on) {
 		float button_scroll_speed = 2;
 		struct normalized_coords scroll_delta;
 		scroll_delta.x = axes.delta.x * button_scroll_speed;
@@ -1731,11 +1795,8 @@ tablet_send_events(struct tablet_dispatch *tablet,
 	}
 
 	tablet_send_proximity_in(tablet, tool, device, &axes, time);
-	if (!tablet_send_tip(tablet, tool, device, &axes, time)) {
-		if (tablet->device->scroll.method != LIBINPUT_CONFIG_SCROLL_ON_BUTTON_DOWN
-			|| !bit_is_set(tablet->button_state.bits, tablet->device->scroll.button))
-			tablet_send_axes(tablet, tool, device, &axes, time);
-	}
+	if (!tablet_send_tip(tablet, tool, device, &axes, time) && !scroll_mode_on)
+		tablet_send_axes(tablet, tool, device, &axes, time);
 
 	tablet_unset_status(tablet, TABLET_TOOL_ENTERING_CONTACT);
 	tablet_reset_changed_axes(tablet);
